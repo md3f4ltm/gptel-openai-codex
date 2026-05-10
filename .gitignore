@@ -1,0 +1,5 @@
+*.elc
+*-autoloads.el
+/.dir-locals-2.el
+/node_modules/
+/.cache/
