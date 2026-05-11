@@ -12,7 +12,7 @@ Codex endpoint, not the official OpenAI API key flow.
 ## Requirements
 
 - Emacs 29.1 or newer
-- gptel 0.9.8 or newer
+- [gptel](https://github.com/karthink/gptel)
 - An OpenAI account with access to Codex models
 
 ## Installation
