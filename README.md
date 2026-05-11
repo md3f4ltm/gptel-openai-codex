@@ -6,6 +6,9 @@ This package lets gptel talk to the ChatGPT Codex responses endpoint with a
 browser OAuth login. It stores its own token file and does not reuse
 `~/.codex/auth.json` by default.
 
+This is an unofficial package. It uses the ChatGPT Codex browser-login flow and
+Codex endpoint, not the official OpenAI API key flow.
+
 ## Requirements
 
 - Emacs 29.1 or newer
@@ -21,7 +24,8 @@ With `use-package` and `straight.el`:
   :straight (:host github :repo "md3f4ltm/gptel-openai-codex")
   :after gptel
   :config
-  (setq gptel-backend (gptel-make-openai-codex "OpenAI Codex" :stream t)
+  (setq gptel-backend (gptel-openai-codex-make-backend
+                       "OpenAI Codex" :stream t)
         gptel-model 'gpt-5.5
         gptel-default-model "gpt-5.5"
         gptel-stream t))
@@ -40,7 +44,8 @@ Then configure gptel:
 ```elisp
 (require 'gptel-openai-codex)
 
-(setq gptel-backend (gptel-make-openai-codex "OpenAI Codex" :stream t)
+(setq gptel-backend (gptel-openai-codex-make-backend
+                     "OpenAI Codex" :stream t)
       gptel-model 'gpt-5.5
       gptel-default-model "gpt-5.5"
       gptel-stream t)
@@ -50,7 +55,7 @@ To set a default reasoning effort for the backend:
 
 ```elisp
 (setq gptel-backend
-      (gptel-make-openai-codex "OpenAI Codex"
+      (gptel-openai-codex-make-backend "OpenAI Codex"
         :stream t
         :reasoning-effort "medium"))
 ```
@@ -68,6 +73,13 @@ M-x gptel-openai-codex-set-reasoning-effort
 ```
 
 Valid values are `low`, `medium`, `high`, and `xhigh`.
+
+To add the `-R` entry to `gptel-menu`, call:
+
+```elisp
+(with-eval-after-load 'gptel-transient
+  (gptel-openai-codex-setup-transient))
+```
 
 ## Login
 
@@ -110,5 +122,5 @@ that behavior:
 
 ## Notes
 
-This uses the OpenAI Codex browser-login flow and the ChatGPT Codex endpoint,
-not the OpenAI API key flow.
+This package depends on an unofficial browser-login endpoint. If that endpoint
+changes, login or requests may need package updates.

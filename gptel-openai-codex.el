@@ -36,7 +36,7 @@
 (defcustom gptel-openai-codex-auth-file
   (expand-file-name "gptel/openai-codex-auth.json"
                     (or (getenv "XDG_STATE_HOME") "~/.local/state"))
-  "gptel OpenAI Codex browser-login auth file."
+  "Gptel OpenAI Codex browser-login auth file."
   :type 'file
   :group 'gptel-openai-codex)
 
@@ -609,7 +609,8 @@ Choose \"default\" to remove the override."
                          :json-false))))
   (message "OpenAI Codex reasoning effort: %s" (or effort "service default")))
 
-(with-eval-after-load 'gptel-transient
+(defun gptel-openai-codex-setup-transient ()
+  "Add OpenAI Codex options to `gptel-menu'."
   (transient-define-suffix gptel-openai-codex--suffix-reasoning-effort ()
     "Set OpenAI Codex reasoning effort from `gptel-menu'."
     :key "-R"
@@ -668,7 +669,7 @@ Choose \"default\" to remove the override."
     item))
 
 (cl-defmethod gptel--request-data ((_backend gptel-openai-codex) _prompts)
-  "JSON encode PROMPTS for sending to the OpenAI Codex endpoint."
+  "Encode request data for the OpenAI Codex endpoint."
   (let ((data (cl-call-next-method)))
     (unless (plist-get data :instructions)
       (plist-put data :instructions gptel-openai-codex-default-instructions))
@@ -693,7 +694,7 @@ Choose \"default\" to remove the override."
     data))
 
 ;;;###autoload
-(cl-defun gptel-make-openai-codex
+(cl-defun gptel-openai-codex-make-backend
     (name &key curl-args (models gptel-openai-codex-models)
           stream request-params reasoning-effort
           (host gptel-openai-codex-host)
@@ -704,11 +705,14 @@ Choose \"default\" to remove the override."
              `(("Authorization" . ,(concat "Bearer "
                                            (gptel-openai-codex-access-token)))
                ("OpenAI-Beta" . "responses=experimental")))))
-  "Register an OpenAI Codex browser-login backend for gptel with NAME.
+  "Register an OpenAI Codex browser-login backend named NAME.
+
+CURL-ARGS, MODELS, STREAM, REQUEST-PARAMS, HOST, PROTOCOL,
+ENDPOINT and HEADER are passed to the backend.
 
 REASONING-EFFORT may be nil, \"low\", \"medium\", \"high\" or
-\"xhigh\".  It is added to backend request parameters unless
-REQUEST-PARAMS already contains :reasoning."
+\"xhigh\".  It is added to REQUEST-PARAMS unless that already
+contains :reasoning."
   (declare (indent 1))
   (let* ((reasoning (gptel-openai-codex--reasoning reasoning-effort))
          (request-params
@@ -733,6 +737,11 @@ REQUEST-PARAMS already contains :reasoning."
       (setf (alist-get name gptel--known-backends
                        nil nil #'equal)
             backend))))
+
+(define-obsolete-function-alias
+  'gptel-make-openai-codex
+  #'gptel-openai-codex-make-backend
+  "0.2.0")
 
 (provide 'gptel-openai-codex)
 ;;; gptel-openai-codex.el ends here
