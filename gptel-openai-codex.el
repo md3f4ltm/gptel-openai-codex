@@ -252,79 +252,81 @@ default.  Non-nil values are sent as `reasoning.effort'."
                   "</body></html>")
           title title body))
 
-(defun gptel-openai-codex--wait-for-callback (state)
-  "Wait for an OAuth callback matching STATE and return its code."
-  (let ((callback nil)
-        (server nil))
-    (unwind-protect
-        (progn
-          (setq server
-                (make-network-process
-                 :name "gptel-openai-codex-callback"
-                 :server t
-                 :host gptel-openai-codex-callback-host
-                 :service gptel-openai-codex-callback-port
-                 :noquery t
-                 :filter
-                 (lambda (process string)
-                   (process-put process 'request
-                                (concat (or (process-get process 'request) "")
-                                        string))
-                   (when (string-match "\r?\n\r?\n"
-                                       (process-get process 'request))
-                     (let* ((request (process-get process 'request))
-                            (path (and (string-match
-                                        "\\`GET \\([^ ]+\\) HTTP/" request)
-                                       (match-string 1 request)))
-                            (query (and path
-                                        (string-match "\\?\\(.*\\)" path)
-                                        (match-string 1 path)))
-                            (params (and query
-                                         (url-parse-query-string query)))
-                            (received-state (cadr (assoc "state" params)))
-                            (code (cadr (assoc "code" params))))
-                       (cond
-                        ((not (and path
-                                   (string-prefix-p "/auth/callback" path)))
-                         (process-send-string
-                          process
-                          (gptel-openai-codex--callback-response
-                           "OpenAI Codex login failed"
-                           "Callback route not found.")))
-                        ((not (equal received-state state))
-                         (setq callback :state-mismatch)
-                         (process-send-string
-                          process
-                          (gptel-openai-codex--callback-response
-                           "OpenAI Codex login failed"
-                           "OAuth state mismatch.")))
-                        ((not code)
-                         (setq callback :missing-code)
-                         (process-send-string
-                          process
-                          (gptel-openai-codex--callback-response
-                           "OpenAI Codex login failed"
-                           "Missing authorization code.")))
-                        (t
-                         (setq callback (list :code code
-                                              :state received-state))
-                         (process-send-string
-                          process
-                          (gptel-openai-codex--callback-response
-                           "OpenAI Codex login complete"
-                           "You can close this window and return to Emacs."))))
-                       (delete-process process))))))
-          (message "Waiting for browser callback on http://%s:%d/auth/callback"
-                   gptel-openai-codex-callback-host
-                   gptel-openai-codex-callback-port)
-          (while (null callback)
-            (accept-process-output server 1))
-          (pcase callback
-            (:state-mismatch (user-error "OAuth state mismatch"))
-            (:missing-code (user-error "Missing authorization code"))
-            (`(:code ,code :state ,_) code)))
-      (when (process-live-p server)
-        (delete-process server)))))
+(defun gptel-openai-codex--callback-request (request)
+  "Return a plist describing OAuth callback REQUEST."
+  (let* ((path (and (string-match "\\`GET \\([^ ]+\\) HTTP/" request)
+                    (match-string 1 request)))
+         (query (and path
+                     (string-match "\\?\\(.*\\)" path)
+                     (match-string 1 path)))
+         (params (and query (url-parse-query-string query))))
+    (list :path path
+          :code (cadr (assoc "code" params))
+          :state (cadr (assoc "state" params)))))
+
+(defun gptel-openai-codex--start-callback-server (state callback)
+  "Start an OAuth callback server for STATE.
+
+CALLBACK is called with the authorization code on success, or nil and an error
+message on failure.  This function returns immediately with the server process."
+  (let (server done)
+    (setq
+     server
+     (make-network-process
+      :name "gptel-openai-codex-callback"
+      :server t
+      :host gptel-openai-codex-callback-host
+      :service gptel-openai-codex-callback-port
+      :noquery t
+      :filter
+      (lambda (process string)
+        (process-put process 'request
+                     (concat (or (process-get process 'request) "")
+                             string))
+        (when (and (not done)
+                   (string-match "\r?\n\r?\n"
+                                 (process-get process 'request)))
+          (setq done t)
+          (let* ((parsed
+                  (gptel-openai-codex--callback-request
+                   (process-get process 'request)))
+                 (path (plist-get parsed :path))
+                 (received-state (plist-get parsed :state))
+                 (code (plist-get parsed :code))
+                 error)
+            (cond
+             ((not (and path (string-prefix-p "/auth/callback" path)))
+              (setq error "Callback route not found.")
+              (process-send-string
+               process
+               (gptel-openai-codex--callback-response
+                "OpenAI Codex login failed" error)))
+             ((not (equal received-state state))
+              (setq error "OAuth state mismatch.")
+              (process-send-string
+               process
+               (gptel-openai-codex--callback-response
+                "OpenAI Codex login failed" error)))
+             ((not code)
+              (setq error "Missing authorization code.")
+              (process-send-string
+               process
+               (gptel-openai-codex--callback-response
+                "OpenAI Codex login failed" error)))
+             (t
+              (process-send-string
+               process
+               (gptel-openai-codex--callback-response
+                "OpenAI Codex login complete"
+                "You can close this window and return to Emacs."))))
+            (delete-process process)
+            (when (process-live-p server)
+              (delete-process server))
+            (funcall callback code error))))))
+    (message "Waiting for browser callback on http://%s:%d/auth/callback"
+             gptel-openai-codex-callback-host
+             gptel-openai-codex-callback-port)
+    server))
 
 (defun gptel-openai-codex--jwt-account-id (access)
   "Return the ChatGPT account id from ACCESS."
@@ -382,6 +384,59 @@ default.  Non-nil values are sent as `reasoning.effort'."
                         (gptel-openai-codex--jwt-account-id access)))))
       (kill-buffer buffer))))
 
+(defun gptel-openai-codex--exchange-token-async (params callback)
+  "Exchange OAuth PARAMS asynchronously.
+
+CALLBACK is called with credentials on success, or nil and an error message on
+failure."
+  (let ((url-request-method "POST")
+        (url-request-extra-headers
+         '(("Content-Type" . "application/x-www-form-urlencoded")))
+        (url-request-data (url-build-query-string params)))
+    (url-retrieve
+     gptel-openai-codex--token-url
+     (lambda (status)
+       (unwind-protect
+           (condition-case error
+               (if-let* ((url-error (plist-get status :error)))
+                   (funcall callback nil (format "%S" url-error))
+                 (goto-char (point-min))
+                 (let ((http-status
+                        (and (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
+                             (string-to-number (match-string 1)))))
+                   (unless (and http-status (<= 200 http-status 299))
+                     (user-error "Token request failed (%s): %s"
+                                 (or http-status "unknown")
+                                 (string-trim
+                                  (buffer-substring-no-properties
+                                   (point-min) (point-max))))))
+                 (unless (re-search-forward "\r?\n\r?\n" nil t)
+                   (user-error "Token response missing body"))
+                 (let* ((json-object-type 'alist)
+                        (json-array-type 'list)
+                        (json-key-type 'symbol)
+                        (json (json-read))
+                        (access (alist-get 'access_token json))
+                        (refresh (alist-get 'refresh_token json))
+                        (expires-in (alist-get 'expires_in json)))
+                   (unless (and (stringp access)
+                                (stringp refresh)
+                                (numberp expires-in))
+                     (user-error "Token response missing expected fields"))
+                   (funcall
+                    callback
+                    (list (cons 'access access)
+                          (cons 'refresh refresh)
+                          (cons 'expires (+ (* (float-time) 1000)
+                                            (* expires-in 1000)))
+                          (cons 'accountId
+                                (gptel-openai-codex--jwt-account-id access)))
+                    nil)))
+             (error
+              (funcall callback nil (error-message-string error))))
+         (kill-buffer (current-buffer))))
+     nil t t)))
+
 (defun gptel-openai-codex--write-auth (credentials)
   "Write CREDENTIALS to `gptel-openai-codex-auth-file'."
   (make-directory (file-name-directory gptel-openai-codex-auth-file) t)
@@ -404,32 +459,50 @@ default.  Non-nil values are sent as `reasoning.effort'."
          (url (gptel-openai-codex--auth-url
                state (plist-get pkce :challenge))))
     (message "Starting OpenAI Codex browser login for gptel.")
-    (browse-url url)
-    (let ((code
-           (condition-case error
-               (gptel-openai-codex--wait-for-callback state)
-             (file-error
-              (message "%s" (error-message-string error))
-              (let* ((input (read-string
-                             "Paste the authorization code or redirect URL: "))
-                     (parsed
-                      (gptel-openai-codex--parse-authorization-input input))
-                     (received-state (plist-get parsed :state)))
-                (when (and received-state
-                           (not (equal received-state state)))
-                  (user-error "OAuth state mismatch"))
-                (or (plist-get parsed :code)
-                    (user-error "Missing authorization code")))))))
-      (let ((credentials
-             (gptel-openai-codex--exchange-token
-              `(("grant_type" "authorization_code")
-                ("client_id" ,gptel-openai-codex--client-id)
-                ("code" ,code)
-                ("code_verifier" ,(plist-get pkce :verifier))
-                ("redirect_uri" ,(gptel-openai-codex--redirect-uri))))))
-        (gptel-openai-codex--write-auth credentials)
-        (message "OpenAI Codex auth saved to %s"
-                 gptel-openai-codex-auth-file)))))
+    (condition-case error
+        (progn
+          (gptel-openai-codex--start-callback-server
+           state
+           (lambda (code callback-error)
+             (if callback-error
+                 (message "OpenAI Codex login failed: %s" callback-error)
+               (gptel-openai-codex--exchange-token-async
+                `(("grant_type" "authorization_code")
+                  ("client_id" ,gptel-openai-codex--client-id)
+                  ("code" ,code)
+                  ("code_verifier" ,(plist-get pkce :verifier))
+                  ("redirect_uri" ,(gptel-openai-codex--redirect-uri)))
+                (lambda (credentials token-error)
+                  (if token-error
+                      (message "OpenAI Codex token exchange failed: %s"
+                               token-error)
+                    (gptel-openai-codex--write-auth credentials)
+                    (message "OpenAI Codex auth saved to %s"
+                             gptel-openai-codex-auth-file)))))))
+          (browse-url url))
+      (file-error
+       (message "%s" (error-message-string error))
+       (let* ((input (read-string
+                      "Paste the authorization code or redirect URL: "))
+              (parsed (gptel-openai-codex--parse-authorization-input input))
+              (received-state (plist-get parsed :state))
+              (code (plist-get parsed :code)))
+         (when (and received-state (not (equal received-state state)))
+           (user-error "OAuth state mismatch"))
+         (unless code
+           (user-error "Missing authorization code"))
+         (gptel-openai-codex--exchange-token-async
+          `(("grant_type" "authorization_code")
+            ("client_id" ,gptel-openai-codex--client-id)
+            ("code" ,code)
+            ("code_verifier" ,(plist-get pkce :verifier))
+            ("redirect_uri" ,(gptel-openai-codex--redirect-uri)))
+          (lambda (credentials token-error)
+            (if token-error
+                (message "OpenAI Codex token exchange failed: %s" token-error)
+              (gptel-openai-codex--write-auth credentials)
+              (message "OpenAI Codex auth saved to %s"
+                       gptel-openai-codex-auth-file)))))))))
 
 ;;;###autoload
 (defun gptel-openai-codex-refresh ()
