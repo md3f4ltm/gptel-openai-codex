@@ -10,7 +10,6 @@ browser OAuth login. It stores its own token file and does not reuse
 
 - Emacs 29.1 or newer
 - gptel 0.9.8 or newer
-- Node.js 20 or newer
 - An OpenAI account with access to Codex models
 
 ## Installation
@@ -98,7 +97,8 @@ Available auth commands:
       (expand-file-name "gptel/openai-codex-auth.json"
                         (or (getenv "XDG_STATE_HOME") "~/.local/state")))
 
-(setq gptel-openai-codex-node-command "node")
+(setq gptel-openai-codex-callback-host "127.0.0.1")
+(setq gptel-openai-codex-callback-port 1455)
 ```
 
 By default the package does not fall back to Codex CLI auth. If you really want

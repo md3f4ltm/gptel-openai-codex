@@ -17,9 +17,12 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'browse-url)
 (require 'json)
 (require 'subr-x)
 (require 'transient nil t)
+(require 'url)
+(require 'url-util)
 (require 'gptel-openai-responses)
 
 (cl-defstruct (gptel-openai-codex (:constructor gptel--make-openai-codex)
@@ -37,21 +40,18 @@
   :type 'file
   :group 'gptel-openai-codex)
 
-(defcustom gptel-openai-codex-node-command "node"
-  "Node.js command used to run the OpenAI Codex browser-login helper."
-  :type 'file
-  :group 'gptel-openai-codex)
-
-(defcustom gptel-openai-codex-helper
-  (expand-file-name
-   "gptel-openai-codex-auth.mjs"
-   (file-name-directory (or load-file-name buffer-file-name)))
-  "Node.js helper used for OpenAI Codex browser login and token refresh."
-  :type 'file
-  :group 'gptel-openai-codex)
-
 (defcustom gptel-openai-codex-refresh-margin 300
   "Refresh Codex browser-login tokens this many seconds before expiry."
+  :type 'integer
+  :group 'gptel-openai-codex)
+
+(defcustom gptel-openai-codex-callback-host "127.0.0.1"
+  "Host for the local OpenAI Codex browser-login callback server."
+  :type 'string
+  :group 'gptel-openai-codex)
+
+(defcustom gptel-openai-codex-callback-port 1455
+  "Port for the local OpenAI Codex browser-login callback server."
   :type 'integer
   :group 'gptel-openai-codex)
 
@@ -80,6 +80,12 @@ default.  Non-nil values are sent as `reasoning.effort'."
 
 (defconst gptel-openai-codex-host "chatgpt.com")
 (defconst gptel-openai-codex-endpoint "/backend-api/codex/responses")
+(defconst gptel-openai-codex--client-id "app_EMoamEEZ73f0CkXaXp7hrann")
+(defconst gptel-openai-codex--authorize-url
+  "https://auth.openai.com/oauth/authorize")
+(defconst gptel-openai-codex--token-url "https://auth.openai.com/oauth/token")
+(defconst gptel-openai-codex--scope "openid profile email offline_access")
+(defconst gptel-openai-codex--jwt-claim-path "https://api.openai.com/auth")
 
 (defconst gptel-openai-codex-models
   '((gpt-5.5 :description "OpenAI Codex GPT-5.5"
@@ -167,60 +173,280 @@ default.  Non-nil values are sent as `reasoning.effort'."
              (< (- (/ expires 1000.0) (float-time))
                 gptel-openai-codex-refresh-margin)))))
 
-(defun gptel-openai-codex--call-helper (command)
-  "Run OpenAI Codex auth helper COMMAND synchronously."
-  (unless (executable-find gptel-openai-codex-node-command)
-    (user-error "Cannot find Node.js command `%s'"
-                gptel-openai-codex-node-command))
-  (unless (file-readable-p gptel-openai-codex-helper)
-    (user-error "Cannot read OpenAI Codex auth helper at %s"
-                gptel-openai-codex-helper))
-  (let ((process-environment
-         (cons (concat "GPTEL_OPENAI_CODEX_AUTH_FILE="
-                       (expand-file-name gptel-openai-codex-auth-file))
-               process-environment)))
-    (with-temp-buffer
-      (let ((status (call-process gptel-openai-codex-node-command nil t nil
-                                  gptel-openai-codex-helper command)))
-        (unless (zerop status)
-          (user-error "OpenAI Codex auth helper failed: %s"
-                      (string-trim (buffer-string))))))))
+(defun gptel-openai-codex--base64url-encode-string (string)
+  "Base64url encode STRING."
+  (replace-regexp-in-string
+   "=" ""
+   (replace-regexp-in-string
+    "/" "_"
+    (replace-regexp-in-string
+     "\\+" "-"
+     (base64-encode-string string t)))))
+
+(defun gptel-openai-codex--random-bytes (length)
+  "Return LENGTH pseudo-random bytes as a unibyte string."
+  (apply #'unibyte-string
+         (cl-loop repeat length collect (random 256))))
+
+(defun gptel-openai-codex--make-pkce ()
+  "Return a plist with PKCE verifier and challenge."
+  (let* ((verifier
+          (gptel-openai-codex--base64url-encode-string
+           (gptel-openai-codex--random-bytes 32)))
+         (challenge
+          (gptel-openai-codex--base64url-encode-string
+           (secure-hash 'sha256 verifier nil nil t))))
+    (list :verifier verifier :challenge challenge)))
+
+(defun gptel-openai-codex--redirect-uri ()
+  "Return the OAuth redirect URI."
+  (format "http://localhost:%d/auth/callback"
+          gptel-openai-codex-callback-port))
+
+(defun gptel-openai-codex--auth-url (state challenge)
+  "Return the OpenAI authorization URL for STATE and PKCE CHALLENGE."
+  (concat
+   gptel-openai-codex--authorize-url
+   "?"
+   (url-build-query-string
+    `(("response_type" "code")
+      ("client_id" ,gptel-openai-codex--client-id)
+      ("redirect_uri" ,(gptel-openai-codex--redirect-uri))
+      ("scope" ,gptel-openai-codex--scope)
+      ("code_challenge" ,challenge)
+      ("code_challenge_method" "S256")
+      ("state" ,state)
+      ("id_token_add_organizations" "true")
+      ("codex_cli_simplified_flow" "true")
+      ("originator" "gptel")))))
+
+(defun gptel-openai-codex--parse-authorization-input (input)
+  "Parse an authorization code and state from INPUT."
+  (let ((value (string-trim input)))
+    (cond
+     ((string-empty-p value) nil)
+     ((string-match-p "\\`https?://" value)
+      (let* ((url (url-generic-parse-url value))
+             (query (url-filename url))
+             (query (when (string-match "\\?\\(.*\\)" query)
+                      (match-string 1 query)))
+             (params (and query (url-parse-query-string query))))
+        (list :code (cadr (assoc "code" params))
+              :state (cadr (assoc "state" params)))))
+     ((string-match "\\`\\([^#]+\\)#\\(.+\\)\\'" value)
+      (list :code (match-string 1 value)
+            :state (match-string 2 value)))
+     ((string-match-p "code=" value)
+      (let ((params (url-parse-query-string value)))
+        (list :code (cadr (assoc "code" params))
+              :state (cadr (assoc "state" params)))))
+     (t (list :code value)))))
+
+(defun gptel-openai-codex--callback-response (title body)
+  "Return a small HTML callback page with TITLE and BODY."
+  (format (concat "HTTP/1.1 200 OK\r\n"
+                  "Content-Type: text/html; charset=utf-8\r\n"
+                  "Connection: close\r\n\r\n"
+                  "<!doctype html><html><head><meta charset=\"utf-8\">"
+                  "<title>%s</title></head><body><h2>%s</h2><p>%s</p>"
+                  "</body></html>")
+          title title body))
+
+(defun gptel-openai-codex--wait-for-callback (state)
+  "Wait for an OAuth callback matching STATE and return its code."
+  (let ((callback nil)
+        (server nil))
+    (unwind-protect
+        (progn
+          (setq server
+                (make-network-process
+                 :name "gptel-openai-codex-callback"
+                 :server t
+                 :host gptel-openai-codex-callback-host
+                 :service gptel-openai-codex-callback-port
+                 :noquery t
+                 :filter
+                 (lambda (process string)
+                   (process-put process 'request
+                                (concat (or (process-get process 'request) "")
+                                        string))
+                   (when (string-match "\r?\n\r?\n"
+                                       (process-get process 'request))
+                     (let* ((request (process-get process 'request))
+                            (path (and (string-match
+                                        "\\`GET \\([^ ]+\\) HTTP/" request)
+                                       (match-string 1 request)))
+                            (query (and path
+                                        (string-match "\\?\\(.*\\)" path)
+                                        (match-string 1 path)))
+                            (params (and query
+                                         (url-parse-query-string query)))
+                            (received-state (cadr (assoc "state" params)))
+                            (code (cadr (assoc "code" params))))
+                       (cond
+                        ((not (and path
+                                   (string-prefix-p "/auth/callback" path)))
+                         (process-send-string
+                          process
+                          (gptel-openai-codex--callback-response
+                           "OpenAI Codex login failed"
+                           "Callback route not found.")))
+                        ((not (equal received-state state))
+                         (setq callback :state-mismatch)
+                         (process-send-string
+                          process
+                          (gptel-openai-codex--callback-response
+                           "OpenAI Codex login failed"
+                           "OAuth state mismatch.")))
+                        ((not code)
+                         (setq callback :missing-code)
+                         (process-send-string
+                          process
+                          (gptel-openai-codex--callback-response
+                           "OpenAI Codex login failed"
+                           "Missing authorization code.")))
+                        (t
+                         (setq callback (list :code code
+                                              :state received-state))
+                         (process-send-string
+                          process
+                          (gptel-openai-codex--callback-response
+                           "OpenAI Codex login complete"
+                           "You can close this window and return to Emacs."))))
+                       (delete-process process))))))
+          (message "Waiting for browser callback on http://%s:%d/auth/callback"
+                   gptel-openai-codex-callback-host
+                   gptel-openai-codex-callback-port)
+          (while (null callback)
+            (accept-process-output server 1))
+          (pcase callback
+            (:state-mismatch (user-error "OAuth state mismatch"))
+            (:missing-code (user-error "Missing authorization code"))
+            (`(:code ,code :state ,_) code)))
+      (when (process-live-p server)
+        (delete-process server)))))
+
+(defun gptel-openai-codex--jwt-account-id (access)
+  "Return the ChatGPT account id from ACCESS."
+  (let* ((payload (cadr (split-string access "\\.")))
+         (json-object-type 'alist)
+         (json-array-type 'list)
+         (json-key-type 'string)
+         (decoded (and payload
+                       (gptel-openai-codex--base64url-decode-string payload)))
+         (parsed (and decoded (json-read-from-string decoded)))
+         (auth (cdr (assoc gptel-openai-codex--jwt-claim-path parsed)))
+         (account-id (cdr (assoc "chatgpt_account_id" auth))))
+    (unless (and (stringp account-id) (not (string-empty-p account-id)))
+      (user-error "Could not extract ChatGPT account id from access token"))
+    account-id))
+
+(defun gptel-openai-codex--exchange-token (params)
+  "Exchange OAuth PARAMS for OpenAI Codex credentials."
+  (let* ((url-request-method "POST")
+         (url-request-extra-headers
+          '(("Content-Type" . "application/x-www-form-urlencoded")))
+         (url-request-data (url-build-query-string params))
+         (buffer (url-retrieve-synchronously
+                  gptel-openai-codex--token-url t t 30)))
+    (unless buffer
+      (user-error "Token request failed"))
+    (unwind-protect
+        (with-current-buffer buffer
+          (goto-char (point-min))
+          (let ((status (and (looking-at "HTTP/[0-9.]+ \\([0-9]+\\)")
+                             (string-to-number (match-string 1)))))
+            (unless (and status (<= 200 status 299))
+              (user-error "Token request failed (%s): %s"
+                          (or status "unknown")
+                          (string-trim (buffer-substring-no-properties
+                                        (point-min) (point-max))))))
+          (unless (re-search-forward "\r?\n\r?\n" nil t)
+            (user-error "Token response missing body"))
+          (let* ((json-object-type 'alist)
+                 (json-array-type 'list)
+                 (json-key-type 'symbol)
+                 (json (json-read))
+                 (access (alist-get 'access_token json))
+                 (refresh (alist-get 'refresh_token json))
+                 (expires-in (alist-get 'expires_in json)))
+            (unless (and (stringp access)
+                         (stringp refresh)
+                         (numberp expires-in))
+              (user-error "Token response missing expected fields"))
+            (list (cons 'access access)
+                  (cons 'refresh refresh)
+                  (cons 'expires (+ (* (float-time) 1000)
+                                    (* expires-in 1000)))
+                  (cons 'accountId
+                        (gptel-openai-codex--jwt-account-id access)))))
+      (kill-buffer buffer))))
+
+(defun gptel-openai-codex--write-auth (credentials)
+  "Write CREDENTIALS to `gptel-openai-codex-auth-file'."
+  (make-directory (file-name-directory gptel-openai-codex-auth-file) t)
+  (with-temp-file gptel-openai-codex-auth-file
+    (let ((json-encoding-pretty-print t))
+      (insert (json-encode (append credentials
+                                   `((updatedAt . ,(* (float-time) 1000)))))
+              "\n")))
+  (set-file-modes gptel-openai-codex-auth-file #o600))
 
 ;;;###autoload
 (defun gptel-openai-codex-login ()
   "Start OpenAI Codex browser login for gptel."
   (interactive)
-  (unless (executable-find gptel-openai-codex-node-command)
-    (user-error "Cannot find Node.js command `%s'"
-                gptel-openai-codex-node-command))
-  (unless (file-readable-p gptel-openai-codex-helper)
-    (user-error "Cannot read OpenAI Codex auth helper at %s"
-                gptel-openai-codex-helper))
-  (let* ((buffer (get-buffer-create "*gptel OpenAI Codex login*"))
-         (process-environment
-          (cons (concat "GPTEL_OPENAI_CODEX_AUTH_FILE="
-                        (expand-file-name gptel-openai-codex-auth-file))
-                process-environment)))
-    (with-current-buffer buffer
-      (erase-buffer)
-      (special-mode))
-    (pop-to-buffer buffer)
-    (make-process
-     :name "gptel-openai-codex-login"
-     :buffer buffer
-     :command (list gptel-openai-codex-node-command
-                    gptel-openai-codex-helper
-                    "login")
-     :sentinel
-     (lambda (_process event)
-       (when (string-match-p "\\(?:finished\\|exited\\)" event)
-         (message "gptel OpenAI Codex login %s" (string-trim event)))))))
+  (random t)
+  (let* ((pkce (gptel-openai-codex--make-pkce))
+         (state (secure-hash 'sha256
+                             (concat (gptel-openai-codex--random-bytes 16)
+                                     (format "%s" (current-time)))))
+         (url (gptel-openai-codex--auth-url
+               state (plist-get pkce :challenge))))
+    (message "Starting OpenAI Codex browser login for gptel.")
+    (browse-url url)
+    (let ((code
+           (condition-case error
+               (gptel-openai-codex--wait-for-callback state)
+             (file-error
+              (message "%s" (error-message-string error))
+              (let* ((input (read-string
+                             "Paste the authorization code or redirect URL: "))
+                     (parsed
+                      (gptel-openai-codex--parse-authorization-input input))
+                     (received-state (plist-get parsed :state)))
+                (when (and received-state
+                           (not (equal received-state state)))
+                  (user-error "OAuth state mismatch"))
+                (or (plist-get parsed :code)
+                    (user-error "Missing authorization code")))))))
+      (let ((credentials
+             (gptel-openai-codex--exchange-token
+              `(("grant_type" "authorization_code")
+                ("client_id" ,gptel-openai-codex--client-id)
+                ("code" ,code)
+                ("code_verifier" ,(plist-get pkce :verifier))
+                ("redirect_uri" ,(gptel-openai-codex--redirect-uri))))))
+        (gptel-openai-codex--write-auth credentials)
+        (message "OpenAI Codex auth saved to %s"
+                 gptel-openai-codex-auth-file)))))
 
 ;;;###autoload
 (defun gptel-openai-codex-refresh ()
   "Refresh gptel OpenAI Codex browser-login credentials."
   (interactive)
-  (gptel-openai-codex--call-helper "refresh"))
+  (let* ((auth (gptel-openai-codex--json-read-file
+                gptel-openai-codex-auth-file))
+         (refresh (alist-get 'refresh auth)))
+    (unless (and (stringp refresh) (not (string-empty-p refresh)))
+      (user-error "No refresh token in %s" gptel-openai-codex-auth-file))
+    (gptel-openai-codex--write-auth
+     (gptel-openai-codex--exchange-token
+      `(("grant_type" "refresh_token")
+        ("refresh_token" ,refresh)
+        ("client_id" ,gptel-openai-codex--client-id))))
+    (message "OpenAI Codex auth refreshed at %s"
+             gptel-openai-codex-auth-file)))
 
 ;;;###autoload
 (defun gptel-openai-codex-logout ()
