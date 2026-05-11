@@ -47,6 +47,29 @@ Then configure gptel:
       gptel-stream t)
 ```
 
+To set a default reasoning effort for the backend:
+
+```elisp
+(setq gptel-backend
+      (gptel-make-openai-codex "OpenAI Codex"
+        :stream t
+        :reasoning-effort "medium"))
+```
+
+You can also set it globally:
+
+```elisp
+(setq gptel-openai-codex-reasoning-effort "medium")
+```
+
+For one buffer, use `gptel-menu` and press `-R`, or run:
+
+```text
+M-x gptel-openai-codex-set-reasoning-effort
+```
+
+Valid values are `low`, `medium`, `high`, and `xhigh`.
+
 ## Login
 
 Run:

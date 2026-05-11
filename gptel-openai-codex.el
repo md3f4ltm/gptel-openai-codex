@@ -19,6 +19,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(require 'transient nil t)
 (require 'gptel-openai-responses)
 
 (cl-defstruct (gptel-openai-codex (:constructor gptel--make-openai-codex)
@@ -60,6 +61,18 @@
   :type 'string
   :group 'gptel-openai-codex)
 
+(defcustom gptel-openai-codex-reasoning-effort nil
+  "Default reasoning effort for OpenAI Codex requests.
+
+When nil, omit the reasoning effort field and let the service choose its
+default.  Non-nil values are sent as `reasoning.effort'."
+  :type '(choice (const :tag "Service default" nil)
+                 (const :tag "Low" "low")
+                 (const :tag "Medium" "medium")
+                 (const :tag "High" "high")
+                 (const :tag "Extra high" "xhigh"))
+  :group 'gptel-openai-codex)
+
 (defcustom gptel-openai-codex-use-codex-cli-auth nil
   "When non-nil, fall back to ~/.codex/auth.json if gptel has no token."
   :type 'boolean
@@ -70,20 +83,24 @@
 
 (defconst gptel-openai-codex-models
   '((gpt-5.5 :description "OpenAI Codex GPT-5.5"
-             :capabilities (media tool-use json url responses-api))
+             :capabilities (reasoning media tool-use json url responses-api))
     (gpt-5.5-pro :description "OpenAI Codex GPT-5.5 Pro"
-                 :capabilities (media tool-use json url responses-api))
+                 :capabilities (reasoning media tool-use json url responses-api))
     (gpt-5.4 :description "OpenAI Codex GPT-5.4"
-             :capabilities (media tool-use json url responses-api))
+             :capabilities (reasoning media tool-use json url responses-api))
     (gpt-5.4-pro :description "OpenAI Codex GPT-5.4 Pro"
-                 :capabilities (media tool-use json url responses-api))
+                 :capabilities (reasoning media tool-use json url responses-api))
     (gpt-5.4-mini :description "OpenAI Codex GPT-5.4 Mini"
-                  :capabilities (media tool-use json url responses-api))
+                  :capabilities (reasoning media tool-use json url responses-api))
     (gpt-5.3-codex :description "OpenAI Codex GPT-5.3"
-                   :capabilities (media tool-use json url responses-api))
+                   :capabilities (reasoning media tool-use json url responses-api))
     (gpt-5.2-codex :description "OpenAI Codex GPT-5.2"
-                   :capabilities (media tool-use json url responses-api)))
+                   :capabilities (reasoning media tool-use json url responses-api)))
   "Known OpenAI Codex browser-login models.")
+
+(defconst gptel-openai-codex-reasoning-efforts
+  '("low" "medium" "high" "xhigh")
+  "Reasoning effort values accepted by OpenAI Codex.")
 
 (defun gptel-openai-codex--json-read-file (file)
   "Read JSON object from FILE as an alist."
@@ -231,6 +248,83 @@
       (user-error "No OpenAI Codex browser-login access token found; run `M-x gptel-openai-codex-login'"))
     access-token))
 
+(defun gptel-openai-codex--normalize-reasoning-effort (effort)
+  "Return normalized reasoning EFFORT, or nil for service default."
+  (cond
+   ((or (null effort) (eq effort :json-false)) nil)
+   ((symbolp effort) (symbol-name effort))
+   ((stringp effort) effort)
+   (t (user-error "Invalid OpenAI Codex reasoning effort: %S" effort))))
+
+(defun gptel-openai-codex--reasoning (effort)
+  "Return request reasoning object for EFFORT."
+  (when-let* ((normalized
+               (gptel-openai-codex--normalize-reasoning-effort effort)))
+    (unless (member normalized gptel-openai-codex-reasoning-efforts)
+      (user-error "Invalid OpenAI Codex reasoning effort `%s'; expected one of: %s"
+                  normalized
+                  (string-join gptel-openai-codex-reasoning-efforts ", ")))
+    (list :effort normalized)))
+
+(defun gptel-openai-codex--current-reasoning-effort ()
+  "Return the currently effective OpenAI Codex reasoning effort."
+  (if (plist-member gptel--request-params :reasoning)
+      (gptel-openai-codex--normalize-reasoning-effort
+       (map-nested-elt gptel--request-params '(:reasoning :effort)))
+    (or (gptel-openai-codex--normalize-reasoning-effort
+         (map-nested-elt (and (boundp 'gptel-backend)
+                              (gptel-backend-request-params gptel-backend))
+                         '(:reasoning :effort)))
+        (gptel-openai-codex--normalize-reasoning-effort
+         gptel-openai-codex-reasoning-effort))))
+
+(defun gptel-openai-codex--reasoning-effort-description ()
+  "Return the transient menu description for Codex reasoning effort."
+  (format "Codex reasoning effort (%s)"
+          (or (gptel-openai-codex--current-reasoning-effort)
+              "default")))
+
+;;;###autoload
+(defun gptel-openai-codex-set-reasoning-effort (effort)
+  "Set OpenAI Codex reasoning EFFORT for the current buffer.
+
+The setting is stored in buffer-local `gptel--request-params', so it overrides
+the package default and backend default for requests sent from this buffer.
+Choose \"default\" to remove the override."
+  (interactive
+   (list
+    (let ((choice (completing-read
+                   "OpenAI Codex reasoning effort: "
+                   (cons "default" gptel-openai-codex-reasoning-efforts)
+                   nil t nil nil
+                   (or (gptel-openai-codex--normalize-reasoning-effort
+                        (map-nested-elt gptel--request-params
+                                        '(:reasoning :effort)))
+                       "default"))))
+      (unless (string= choice "default") choice))))
+  (setq-local gptel--request-params
+              (gptel--merge-plists
+               gptel--request-params
+               (list :reasoning
+                     (or (gptel-openai-codex--reasoning effort)
+                         :json-false))))
+  (message "OpenAI Codex reasoning effort: %s" (or effort "service default")))
+
+(with-eval-after-load 'gptel-transient
+  (transient-define-suffix gptel-openai-codex--suffix-reasoning-effort ()
+    "Set OpenAI Codex reasoning effort from `gptel-menu'."
+    :key "-R"
+    :description #'gptel-openai-codex--reasoning-effort-description
+    :if (lambda ()
+          (and (boundp 'gptel-backend)
+               (gptel-openai-codex-p gptel-backend)))
+    (interactive)
+    (call-interactively #'gptel-openai-codex-set-reasoning-effort))
+  (transient-append-suffix
+    'gptel-menu
+    "-v"
+    '(gptel-openai-codex--suffix-reasoning-effort)))
+
 (defun gptel-openai-codex--content-type (role)
   "Return Codex content type for ROLE."
   (if (equal role "assistant") "output_text" "input_text"))
@@ -279,6 +373,15 @@
   (let ((data (cl-call-next-method)))
     (unless (plist-get data :instructions)
       (plist-put data :instructions gptel-openai-codex-default-instructions))
+    (unless (plist-member data :reasoning)
+      (when-let* ((reasoning
+                   (gptel-openai-codex--reasoning
+                    gptel-openai-codex-reasoning-effort)))
+        (plist-put data :reasoning reasoning)))
+    (when (plist-member gptel--request-params :reasoning)
+      (plist-put data :reasoning (plist-get gptel--request-params :reasoning)))
+    (when (eq (plist-get data :reasoning) :json-false)
+      (cl-remf data :reasoning))
     (plist-put data :store :json-false)
     (plist-put data :stream t)
     (cl-remf data :max_output_tokens)
@@ -293,7 +396,7 @@
 ;;;###autoload
 (cl-defun gptel-make-openai-codex
     (name &key curl-args (models gptel-openai-codex-models)
-          stream request-params
+          stream request-params reasoning-effort
           (host gptel-openai-codex-host)
           (protocol "https")
           (endpoint gptel-openai-codex-endpoint)
@@ -302,9 +405,18 @@
              `(("Authorization" . ,(concat "Bearer "
                                            (gptel-openai-codex-access-token)))
                ("OpenAI-Beta" . "responses=experimental")))))
-  "Register an OpenAI Codex browser-login backend for gptel with NAME."
+  "Register an OpenAI Codex browser-login backend for gptel with NAME.
+
+REASONING-EFFORT may be nil, \"low\", \"medium\", \"high\" or
+\"xhigh\".  It is added to backend request parameters unless
+REQUEST-PARAMS already contains :reasoning."
   (declare (indent 1))
-  (let ((backend (gptel--make-openai-codex
+  (let* ((reasoning (gptel-openai-codex--reasoning reasoning-effort))
+         (request-params
+          (if (or (null reasoning) (plist-member request-params :reasoning))
+              request-params
+            (gptel--merge-plists request-params (list :reasoning reasoning))))
+         (backend (gptel--make-openai-codex
                   :curl-args curl-args
                   :name name
                   :host host
